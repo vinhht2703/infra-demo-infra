@@ -25,6 +25,7 @@ export const ENV = {
   serviceName: `${prefix}-service`,
   logGroupName: `${prefix}-ecs`,
   streamPrefix: `${prefix}-stream`,
+  feFamily: `${prefix}-${getEnv('FE_FAMILY')}`,
 
   // CI CD
   codebuildName: `${prefix}-frontend`,
