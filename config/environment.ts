@@ -32,4 +32,7 @@ export const ENV = {
   pipelineName: `${prefix}-frontend`,
   pipelineNameArtifact: `${prefix}-pipeline-artifact`,
   buildNameArtifact: `${prefix}-build-artifact`,
+
+  // database
+  dbName: `demoInfraDb${stage.toUpperCase()}`,
 };

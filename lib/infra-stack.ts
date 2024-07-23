@@ -13,6 +13,8 @@ import * as custom from "aws-cdk-lib/custom-resources";
 import * as elb from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as codedeploy from "aws-cdk-lib/aws-codedeploy";
 import * as pipelineactions from "aws-cdk-lib/aws-codepipeline-actions";
+import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
+import * as rds from "aws-cdk-lib/aws-rds";
 import { ENV } from '../config/environment';
 
 export class InfraStack extends cdk.Stack {
@@ -22,25 +24,24 @@ export class InfraStack extends cdk.Stack {
     // Create cluster vpc
     const clusterVpc = initVpc(this)
 
+    // Create MySql RDS
+    const rds = initMySqlRds(this, clusterVpc)
+
     // Create an ECR repository
     const ecrRepository = new ecr.Repository(this, 'MyEcrRepo');
 
     // Create Fargate service
-    const { ecsService, publicAlb, albListener, targetGroupBlue, targetGroupGreen } = initFargate(this, ecrRepository, clusterVpc)
+    const { ecsService, albListener, targetGroupBlue, targetGroupGreen } = initFargate(this, ecrRepository, clusterVpc)
 
     // Create CICD
-    const { pipeline, buildProject } = initCICD({ scope: this, ecrRepository, ecsService, albListener, targetGroupBlue, targetGroupGreen })
+    const feCICD = initCicdFrontend({ scope: this, ecrRepository, ecsService, albListener, targetGroupBlue, targetGroupGreen })
+    // const beCICD = initCicdBackend({ scope: this, ecrRepository, ecsService, albListener, targetGroupBlue, targetGroupGreen })
 
     // Create trigger codebuild lambda
-    const triggerLambda = initTriggerCodeBuildLambda(this, buildProject)
+    const triggerLambda = initTriggerCodeBuildLambda(this, feCICD.buildProject)
 
     // Deploys the cluster VPC after the initial image build triggers
     clusterVpc.node.addDependency(triggerLambda);
-
-    // Outputs the ALB public endpoint
-    new cdk.CfnOutput(this, "PublicAlbEndpoint", {
-      value: "http://" + publicAlb.loadBalancerDnsName,
-    });
   }
 }
 
@@ -127,10 +128,15 @@ function initFargate(scope: Construct, ecrRepository: cdk.aws_ecr.Repository, cl
   // Adds the ECS Fargate service to the ALB target group
   ecsService.attachToApplicationTargetGroup(targetGroupBlue);
 
-  return { ecsService, publicAlb, albListener, targetGroupBlue, targetGroupGreen }
+  // Outputs the ALB public endpoint
+  new cdk.CfnOutput(scope, "PublicAlbEndpoint", {
+    value: "http://" + publicAlb.loadBalancerDnsName,
+  });
+
+  return { ecsService, albListener, targetGroupBlue, targetGroupGreen }
 }
 
-function initCICD(
+function initCicdFrontend(
   {
     scope,
     ecrRepository,
@@ -366,4 +372,90 @@ function initVpc(scope: Construct) {
   });
 
   return clusterVpc
+}
+
+function initMySqlRds(scope: Construct, vpc: ec2.Vpc) {
+  // Create a Security Group for the RDS instance
+  const rdsSecurityGroup = new ec2.SecurityGroup(scope, 'RdsSecurityGroup', {
+    vpc,
+    allowAllOutbound: true,
+  });
+  rdsSecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(3306), 'Allow MySQL traffic');
+
+  // Create a Security Group for the EC2 instance
+  const ec2SecurityGroup = new ec2.SecurityGroup(scope, 'Ec2SecurityGroup', {
+    vpc,
+    allowAllOutbound: true,
+  });
+  ec2SecurityGroup.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(22), 'Allow SSH access');
+
+  // Allow EC2 to connect to RDS
+  rdsSecurityGroup.addIngressRule(ec2SecurityGroup, ec2.Port.tcp(3306), 'Allow EC2 access to RDS');
+
+  // Create a Secret for the RDS instance credentials
+  const dbCredentialsSecret = new secretsmanager.Secret(scope, 'DBCredentialsSecret', {
+    secretName: 'mysqlCredentials',
+    generateSecretString: {
+      secretStringTemplate: JSON.stringify({
+        username: 'admin',
+      }),
+      excludePunctuation: true,
+      includeSpace: false,
+      generateStringKey: 'password',
+    },
+  });
+
+  // Create the RDS MySQL instance
+  const dbInstance = new rds.DatabaseInstance(scope, 'MyRdsInstance', {
+    engine: rds.DatabaseInstanceEngine.mysql({
+      version: rds.MysqlEngineVersion.VER_8_0_37,
+    }),
+    instanceType: ec2.InstanceType.of(ec2.InstanceClass.BURSTABLE3, ec2.InstanceSize.MICRO),
+    vpc,
+    credentials: rds.Credentials.fromSecret(dbCredentialsSecret),
+    multiAz: false,
+    allocatedStorage: 20,
+    maxAllocatedStorage: 100,
+    allowMajorVersionUpgrade: false,
+    autoMinorVersionUpgrade: true,
+    backupRetention: cdk.Duration.days(7),
+    deleteAutomatedBackups: true,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+    deletionProtection: false,
+    databaseName: ENV.dbName,
+    securityGroups: [rdsSecurityGroup],
+    publiclyAccessible: true,
+  });
+
+  // Create an EC2 instance
+  const ec2Instance = new ec2.Instance(scope, 'MyEc2Instance', {
+    instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
+    machineImage: ec2.MachineImage.latestAmazonLinux2(),
+    vpc,
+    securityGroup: ec2SecurityGroup,
+    keyName: 'demo-infra-rds-dev', // Replace with your key pair name,
+    vpcSubnets: {
+      subnetType: ec2.SubnetType.PUBLIC,
+    },
+  });
+
+  // Allow the EC2 instance to read the RDS secret
+  dbCredentialsSecret.grantRead(ec2Instance.role);
+
+  // Output the database endpoint
+  new cdk.CfnOutput(scope, 'DBEndpoint', {
+    value: dbInstance.instanceEndpoint.hostname,
+  });
+
+  // Output the secret ARN
+  new cdk.CfnOutput(scope, 'DBSecretARN', {
+    value: dbCredentialsSecret.secretArn,
+  });
+
+  // Output the EC2 instance public DNS
+  new cdk.CfnOutput(scope, 'EC2PublicDNS', {
+    value: ec2Instance.instancePublicDnsName,
+  });
+
+  return { dbRdsInstance: dbInstance, dbEc2Instance: ec2Instance }
 }
