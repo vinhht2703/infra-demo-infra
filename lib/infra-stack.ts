@@ -26,7 +26,7 @@ export class InfraStack extends cdk.Stack {
     const clusterVpc = initVpc(this)
 
     // Create MySql RDS
-    // const rds = initMySqlRds(this, clusterVpc)
+    const rds = initMySqlRds(this, clusterVpc)
 
     SOURCES_CONFIG.forEach(sourceConfig => {
       // if (sourceConfig.type == 'be') {
