@@ -12,8 +12,10 @@ export const ENV = {
 
   // pipeline
   sourceUsername: getEnv('GITHUB_USERNAME'),
-  feSourceRepo: getEnv('GITHUB_REPO'),
-  feSourceBranch: getEnv('GITHUB_BRANCH'),
+  feSourceRepo: getEnv('GITHUB_REPO_FE'),
+  feSourceBranch: getEnv('GITHUB_BRANCH_FE'),
+  beSourceRepo: getEnv('GITHUB_REPO_BE'),
+  beSourceBranch: getEnv('GITHUB_BRANCH_BE'),
   codestarArn: getEnv('CODESTAR_ARN'),
 
   // ECS fargate
@@ -25,13 +27,19 @@ export const ENV = {
   serviceName: `${prefix}-service`,
   logGroupName: `${prefix}-ecs`,
   streamPrefix: `${prefix}-stream`,
-  feFamily: `${prefix}-${getEnv('FE_FAMILY')}`,
+  family: `${prefix}-family`,
 
   // CI CD
-  codebuildName: `${prefix}-frontend`,
-  pipelineName: `${prefix}-frontend`,
-  pipelineNameArtifact: `${prefix}-pipeline-artifact`,
-  buildNameArtifact: `${prefix}-build-artifact`,
+  /// frontend
+  feCodebuildName: `${prefix}-frontend`,
+  fePipelineName: `${prefix}-frontend`,
+  fePipelineNameArtifact: `${prefix}-pipeline-artifact-frontend`,
+  feBuildNameArtifact: `${prefix}-build-artifact-frontend`,
+  /// backend
+  beCodebuildName: `${prefix}-backend`,
+  bePipelineName: `${prefix}-backend`,
+  bePipelineNameArtifact: `${prefix}-pipeline-artifact-backend`,
+  beBuildNameArtifact: `${prefix}-build-artifact-backend`,
 
   // database
   dbName: `demoInfraDb${stage.toUpperCase()}`,

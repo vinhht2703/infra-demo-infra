@@ -16,6 +16,7 @@ import * as pipelineactions from "aws-cdk-lib/aws-codepipeline-actions";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import * as rds from "aws-cdk-lib/aws-rds";
 import { ENV } from '../config/environment';
+import { SOURCES_CONFIG, TSourceConfig } from './config/source-config';
 
 export class InfraStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -25,37 +26,39 @@ export class InfraStack extends cdk.Stack {
     const clusterVpc = initVpc(this)
 
     // Create MySql RDS
-    const rds = initMySqlRds(this, clusterVpc)
+    // const rds = initMySqlRds(this, clusterVpc)
 
-    // Create an ECR repository
-    const ecrRepository = new ecr.Repository(this, 'MyEcrRepo');
+    SOURCES_CONFIG.forEach(sourceConfig => {
+      // if (sourceConfig.type == 'be') {
+      // Create an ECR repository
+      const ecrRepository = new ecr.Repository(this, sourceConfig.ecr.repository);
+      // Create Fargate service
+      const { ecsService, albListener, targetGroupBlue, targetGroupGreen } = initFargate(this, ecrRepository, clusterVpc, sourceConfig)
 
-    // Create Fargate service
-    const { ecsService, albListener, targetGroupBlue, targetGroupGreen } = initFargate(this, ecrRepository, clusterVpc)
+      // Create CICD
+      const cicd = initCicd({ scope: this, ecrRepository, ecsService, albListener, targetGroupBlue, targetGroupGreen, sourceConfig })
 
-    // Create CICD
-    const feCICD = initCicdFrontend({ scope: this, ecrRepository, ecsService, albListener, targetGroupBlue, targetGroupGreen })
-    // const beCICD = initCicdBackend({ scope: this, ecrRepository, ecsService, albListener, targetGroupBlue, targetGroupGreen })
+      // Create trigger codebuild lambda
+      const triggerLambda = initTriggerCodeBuildLambda(this, cicd.buildProject, sourceConfig)
 
-    // Create trigger codebuild lambda
-    const triggerLambda = initTriggerCodeBuildLambda(this, feCICD.buildProject)
-
-    // Deploys the cluster VPC after the initial image build triggers
-    clusterVpc.node.addDependency(triggerLambda);
+      // Deploys the cluster VPC after the initial image build triggers
+      clusterVpc.node.addDependency(triggerLambda);
+      // }
+    });
   }
 }
 
-function initFargate(scope: Construct, ecrRepository: cdk.aws_ecr.Repository, clusterVpc: cdk.aws_ec2.Vpc) {
+function initFargate(scope: Construct, ecrRepository: cdk.aws_ecr.Repository, clusterVpc: cdk.aws_ec2.Vpc, sourceConfig: TSourceConfig) {
   // Creates a Task Definition for the ECS Fargate service
   const fargateTaskDef = new ecs.FargateTaskDefinition(
     scope,
-    ENV.taskDefinition
+    sourceConfig.ecs.taskDef
   );
-  fargateTaskDef.addContainer("container", {
-    containerName: ENV.containerName,
+  fargateTaskDef.addContainer(sourceConfig.ecs.container, {
+    containerName: sourceConfig.ecs.container,
     image: ecs.ContainerImage.fromEcrRepository(ecrRepository),
-    memoryLimitMiB: 512,
-    portMappings: [{ containerPort: 80 }],
+    memoryLimitMiB: sourceConfig.ecs.memoryLimitMiB,
+    portMappings: [{ containerPort: sourceConfig.ecs.containerPort }],
   });
 
   // Creates a new blue Target Group that routes traffic from the public Application Load Balancer (ALB) to the
@@ -63,11 +66,19 @@ function initFargate(scope: Construct, ecrRepository: cdk.aws_ecr.Repository, cl
   // https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html
   const targetGroupBlue = new elb.ApplicationTargetGroup(
     scope,
-    "BlueTargetGroup",
+    "BlueTargetGroup" + sourceConfig.name,
     {
-      targetGroupName: "alb-blue-tg",
+      targetGroupName: "alb-blue-tg-" + sourceConfig.type,
       targetType: elb.TargetType.IP,
-      port: 80,
+      port: sourceConfig.ecs.containerPort,
+      protocol: elb.ApplicationProtocol.HTTP,
+      healthCheck: {
+        path: sourceConfig.type == 'be' ? '/health' : '/',
+        interval: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(5),
+        healthyThresholdCount: 2,
+        unhealthyThresholdCount: 2,
+      },
       vpc: clusterVpc,
     }
   );
@@ -75,47 +86,65 @@ function initFargate(scope: Construct, ecrRepository: cdk.aws_ecr.Repository, cl
   // Creates a new green Target Group
   const targetGroupGreen = new elb.ApplicationTargetGroup(
     scope,
-    "GreenTargetGroup",
+    "GreenTargetGroup" + sourceConfig.name,
     {
-      targetGroupName: "alb-green-tg",
+      targetGroupName: "alb-green-tg-" + sourceConfig.type,
       targetType: elb.TargetType.IP,
-      port: 80,
+      port: sourceConfig.ecs.containerPort,
+      protocol: elb.ApplicationProtocol.HTTP,
+      healthCheck: {
+        path: sourceConfig.type == 'be' ? '/health' : '/',
+        interval: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(5),
+        healthyThresholdCount: 2,
+        unhealthyThresholdCount: 2,
+      },
       vpc: clusterVpc,
     }
   );
 
   // Creates a Security Group for the Application Load Balancer (ALB)
-  const albSg = new ec2.SecurityGroup(scope, "SecurityGroup", {
+  const albSg = new ec2.SecurityGroup(scope, sourceConfig.ecs.albSg, {
     vpc: clusterVpc,
     allowAllOutbound: true,
   });
   albSg.addIngressRule(
     ec2.Peer.anyIpv4(),
-    ec2.Port.tcp(80),
-    "Allows access on port 80/http",
+    ec2.Port.tcp(sourceConfig.ecs.containerPort),
+    `Allows access on port ${sourceConfig.ecs.containerPort}/http`,
     false
   );
 
+  if (sourceConfig.type == 'be') {
+    albSg.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(80),
+      `Allows access on port 80/http`,
+      false
+    );
+  }
+
   // Creates a public ALB
-  const publicAlb = new elb.ApplicationLoadBalancer(scope, "PublicAlb", {
+  const publicAlb = new elb.ApplicationLoadBalancer(scope, sourceConfig.ecs.publicAlb, {
     vpc: clusterVpc,
     internetFacing: true,
     securityGroup: albSg,
   });
 
-  // Adds a listener on port 80 to the ALB
-  const albListener = publicAlb.addListener("AlbListener80", {
+  // Adds a listener on port to the ALB
+  const albListener = publicAlb.addListener("AlbListener" + sourceConfig.ecs.containerPort, {
     open: false,
     port: 80,
+    protocol: elb.ApplicationProtocol.HTTP,
     defaultTargetGroups: [targetGroupBlue],
   });
 
   // Define the ECS service
-  const ecsService = new ecs.FargateService(scope, ENV.serviceName, {
-    desiredCount: 1,
-    serviceName: ENV.serviceName,
+  const ecsService = new ecs.FargateService(scope, sourceConfig.ecs.serviceName, {
+    desiredCount: sourceConfig.ecs.desiredCount,
+    serviceName: sourceConfig.ecs.serviceName,
     taskDefinition: fargateTaskDef,
-    cluster: new ecs.Cluster(scope, "EcsCluster", {
+    cluster: new ecs.Cluster(scope, sourceConfig.ecs.cluster, {
       enableFargateCapacityProviders: true,
       vpc: clusterVpc,
     }),
@@ -129,28 +158,30 @@ function initFargate(scope: Construct, ecrRepository: cdk.aws_ecr.Repository, cl
   ecsService.attachToApplicationTargetGroup(targetGroupBlue);
 
   // Outputs the ALB public endpoint
-  new cdk.CfnOutput(scope, "PublicAlbEndpoint", {
+  new cdk.CfnOutput(scope, "PublicAlbEndpoint" + sourceConfig.name, {
     value: "http://" + publicAlb.loadBalancerDnsName,
   });
 
   return { ecsService, albListener, targetGroupBlue, targetGroupGreen }
 }
 
-function initCicdFrontend(
+function initCicd(
   {
     scope,
     ecrRepository,
     ecsService,
     albListener,
     targetGroupBlue,
-    targetGroupGreen
+    targetGroupGreen,
+    sourceConfig
   }: {
     scope: Construct,
     ecrRepository: cdk.aws_ecr.Repository,
     ecsService: cdk.aws_ecs.FargateService,
     albListener: cdk.aws_elasticloadbalancingv2.ApplicationListener,
     targetGroupBlue: cdk.aws_elasticloadbalancingv2.ApplicationTargetGroup,
-    targetGroupGreen: cdk.aws_elasticloadbalancingv2.ApplicationTargetGroup
+    targetGroupGreen: cdk.aws_elasticloadbalancingv2.ApplicationTargetGroup,
+    sourceConfig: TSourceConfig
   }
 ) {
   const taskDefinition = ecsService.taskDefinition
@@ -160,22 +191,22 @@ function initCicdFrontend(
   const buildArtifact = new codepipeline.Artifact('BuildArtifact');
 
   const gitHubSource = codebuild.Source.gitHub({
-    owner: ENV.sourceUsername,
-    repo: ENV.feSourceRepo,
-    webhook: false,
-    branchOrRef: ENV.feSourceBranch,
+    owner: sourceConfig.pipeline.source.owner,
+    repo: sourceConfig.pipeline.source.repo,
+    webhook: sourceConfig.pipeline.source.webhook,
+    branchOrRef: sourceConfig.pipeline.source.branchOrRef,
   });
 
   // Define the build project
-  const buildProject = new codebuild.Project(scope, 'MyProject', {
-    projectName: ENV.codebuildName,
+  const buildProject = new codebuild.Project(scope, sourceConfig.name + 'Project', {
+    projectName: sourceConfig.pipeline.build.projectName,
     source: gitHubSource,
     environment: {
-      buildImage: codebuild.LinuxBuildImage.STANDARD_5_0,
+      buildImage: sourceConfig.pipeline.build.buildImage,
       privileged: true,
     },
     environmentVariables: {
-      CONTAINER_NAME: { value: ENV.containerName },
+      CONTAINER_NAME: { value: sourceConfig.pipeline.build.environmentVariables.containerName },
       REPOSITORY_URI: { value: ecrRepository.repositoryUri },
       AWS_ACCOUNT_ID: { value: process.env?.CDK_DEFAULT_ACCOUNT || "" },
       REGION: { value: process.env?.CDK_DEFAULT_REGION || "" },
@@ -184,57 +215,9 @@ function initCicdFrontend(
       TASK_DEFINITION_ARN: { value: taskDefinition.taskDefinitionArn },
       TASK_ROLE_ARN: { value: taskDefinition.taskRole.roleArn },
       EXECUTION_ROLE_ARN: { value: taskDefinition.executionRole?.roleArn },
-      FAMILY: { value: ENV.feFamily },
+      FAMILY: { value: sourceConfig.pipeline.build.environmentVariables.family },
     },
-    buildSpec: codebuild.BuildSpec.fromObject({
-      version: '0.2',
-      phases: {
-        pre_build: {
-          commands: [
-            'echo $pwd',
-            'ls -la',
-            'cd app',
-            'echo Logging in to Amazon ECR...',
-            'aws --version',
-            'aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com'
-          ],
-        },
-        build: {
-          commands: [
-            'echo Building the Docker image...',
-            'docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .',
-            'docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG'
-          ],
-        },
-        post_build: {
-          commands: [
-            'echo Pushing the Docker image...',
-            'docker push $REPOSITORY_URI:$IMAGE_TAG',
-            'echo Container image to be used $REPOSITORY_URI:$IMAGE_TAG',
-            // `printf \'[{"name":"${ENV.containerName}","imageUri":"%s"}]\' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json`,
-            // 'cat imagedefinitions.json',
-            'pwd; ls -al;',
-            'sed -i "s|CONTAINER_NAME|${CONTAINER_NAME}|g" taskdef.json',
-            'sed -i "s|REPOSITORY_URI|${REPOSITORY_URI}|g" taskdef.json',
-            'sed -i "s|IMAGE_TAG|${IMAGE_TAG}|g" taskdef.json',
-            'sed -i "s|TASK_ROLE_ARN|${TASK_ROLE_ARN}|g" taskdef.json',
-            'sed -i "s|EXECUTION_ROLE_ARN|${EXECUTION_ROLE_ARN}|g" taskdef.json',
-            'sed -i "s|FAMILY|${FAMILY}|g" taskdef.json',
-            'sed -i "s|TASK_DEFINITION_ARN|${TASK_DEFINITION_ARN}|g" appspec.yaml',
-            'sed -i "s|CONTAINER_NAME|${CONTAINER_NAME}|g" appspec.yaml',
-            'cat appspec.yaml && cat taskdef.json',
-            'cp appspec.yaml ../',
-            'cp taskdef.json ../'
-          ]
-        }
-      },
-      env: {
-        'exported-variables': ['REPOSITORY_URI'],
-      },
-      artifacts: {
-        files: ['taskdef.json', 'appspec.yaml'],
-      }
-    }),
+    buildSpec: sourceConfig.pipeline.build.buildSpec,
   });
 
   // Grant necessary permissions to the CodeBuild project
@@ -245,9 +228,9 @@ function initCicdFrontend(
     actions: [
       new codepipeline_actions.CodeStarConnectionsSourceAction({
         actionName: 'GitHub_Source',
-        owner: ENV.sourceUsername,
-        repo: ENV.feSourceRepo,
-        branch: ENV.feSourceBranch, // or the default branch of your GitHub repo
+        owner: sourceConfig.pipeline.source.owner,
+        repo: sourceConfig.pipeline.source.repo,
+        branch: sourceConfig.pipeline.source.branchOrRef, // or the default branch of your GitHub repo
         output: sourceArtifact,
         connectionArn: ENV.codestarArn,
       }),
@@ -269,7 +252,7 @@ function initCicdFrontend(
   // Creates a new CodeDeploy Deployment Group
   const deploymentGroup = new codedeploy.EcsDeploymentGroup(
     scope,
-    "CodeDeployGroup",
+    sourceConfig.name + "CodeDeployGroup",
     {
       service: ecsService,
       // Configurations for CodeDeploy Blue/Green deployments
@@ -294,11 +277,12 @@ function initCicdFrontend(
   }
 
   // Define the pipeline
-  const pipeline = new codepipeline.Pipeline(scope, 'MyPipeline', {
-    pipelineName: ENV.pipelineName,
-    artifactBucket: new s3.Bucket(scope, 'PipelineArtifact', {
-      bucketName: ENV.pipelineNameArtifact,
+  const pipeline = new codepipeline.Pipeline(scope, sourceConfig.name + 'Pipeline', {
+    pipelineName: sourceConfig.pipeline.name,
+    artifactBucket: new s3.Bucket(scope, sourceConfig.name + 'PipelineArtifact', {
+      bucketName: sourceConfig.pipeline.pipelineNameArtifact,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
     }),
     stages: [
       sourceStage,
@@ -310,9 +294,9 @@ function initCicdFrontend(
   return { pipeline, buildProject }
 }
 
-function initTriggerCodeBuildLambda(scope: Construct, buildProject: cdk.aws_codebuild.Project) {
+function initTriggerCodeBuildLambda(scope: Construct, buildProject: cdk.aws_codebuild.Project, sourceConfig: TSourceConfig) {
   // Lambda function that triggers CodeBuild image build project
-  const triggerCodeBuild = new lambda.Function(scope, "BuildLambda", {
+  const triggerCodeBuild = new lambda.Function(scope, "BuildLambda" + sourceConfig.name, {
     architecture: lambda.Architecture.ARM_64,
     code: lambda.Code.fromAsset("./lib/lambda"),
     handler: "trigger-build.handler",
@@ -334,7 +318,7 @@ function initTriggerCodeBuildLambda(scope: Construct, buildProject: cdk.aws_code
   // Triggers a Lambda function using AWS SDK
   return new custom.AwsCustomResource(
     scope,
-    "BuildLambdaTrigger",
+    "BuildLambdaTrigger" + sourceConfig.name,
     {
       installLatestAwsSdk: true,
       policy: custom.AwsCustomResourcePolicy.fromStatements([
