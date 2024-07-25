@@ -25,9 +25,6 @@ export class InfraStack extends cdk.Stack {
     // Create cluster vpc
     const clusterVpc = initVpc(this)
 
-    // Create MySql RDS
-    const rds = initMySqlRds(this, clusterVpc)
-
     SOURCES_CONFIG.forEach(sourceConfig => {
       // if (sourceConfig.type == 'be') {
       // Create an ECR repository
@@ -45,6 +42,12 @@ export class InfraStack extends cdk.Stack {
       clusterVpc.node.addDependency(triggerLambda);
       // }
     });
+
+    // Create MySql RDS
+    const rds = initMySqlRds(this, clusterVpc)
+    // Add dependency to ensure the VPC is created before the RDS instance
+    rds.dbRdsInstance.node.addDependency(clusterVpc)
+    rds.dbEc2Instance.node.addDependency(rds.dbRdsInstance)
   }
 }
 
