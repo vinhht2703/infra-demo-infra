@@ -26,7 +26,6 @@ export class InfraStack extends cdk.Stack {
     const clusterVpc = initVpc(this)
 
     SOURCES_CONFIG.forEach(sourceConfig => {
-      // if (sourceConfig.type == 'be') {
       // Create an ECR repository
       const ecrRepository = new ecr.Repository(this, sourceConfig.ecr.repository);
       // Create Fargate service
@@ -40,7 +39,6 @@ export class InfraStack extends cdk.Stack {
 
       // Deploys the cluster VPC after the initial image build triggers
       clusterVpc.node.addDependency(triggerLambda);
-      // }
     });
 
     // Create MySql RDS
